@@ -6,7 +6,7 @@ import json
 import torch
 from datasets import Dataset
 from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template, standardize_sharegpt
+from unsloth.chat_templates import get_chat_template, train_on_responses_only
 from trl import SFTTrainer, SFTConfig
 from transformers import EarlyStoppingCallback
 
@@ -57,12 +57,11 @@ def main():
     eval_dataset = split["test"]
     print(f"Train split: {len(train_dataset)}, Eval split: {len(eval_dataset)}")
 
-    # --- Load model (QLoRA: 4-bit) ---
+    # --- Load model (bf16 LoRA) ---
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
-        load_in_4bit=True,
-        load_in_16bit=False,
-        full_finetuning=False,
+        load_in_4bit=False,
+        load_in_16bit=True,
     )
 
     # Apply chat template
@@ -84,13 +83,8 @@ def main():
     model = FastLanguageModel.get_peft_model(
         model,
         r=args.lora_r,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
         lora_alpha=args.lora_alpha,
-        lora_dropout=0,
-        bias="none",
         use_gradient_checkpointing="unsloth",
-        random_state=3407,
     )
 
     # --- Train ---
@@ -130,6 +124,12 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=SFTConfig(**training_args),
+    )
+
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part="<|im_start|>user\n",
+        response_part="<|im_start|>assistant\n",
     )
 
     early_stopping = EarlyStoppingCallback(
