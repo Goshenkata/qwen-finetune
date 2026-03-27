@@ -8,7 +8,13 @@ from datasets import Dataset
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template, train_on_responses_only
 from trl import SFTTrainer, SFTConfig
-from transformers import EarlyStoppingCallback
+
+
+LORA_R = 16
+LORA_ALPHA = 32
+BATCH_SIZE = 1
+GRAD_ACCUM = 8
+MAX_SEQ_LEN = 4096  # ~4hr runtime on laptop GPU; longer seqs truncate context but keep response
 
 
 def parse_args():
@@ -17,13 +23,8 @@ def parse_args():
     p.add_argument("--train-file", default="train.json")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum", type=int, default=8)
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--output-dir", default="outputs")
     p.add_argument("--gguf-dir", default="qwen-duplication-gguf")
-    p.add_argument("--eval-split", type=float, default=0.1, help="Fraction of train data for eval")
     p.add_argument("--max-steps", type=int, default=-1, help="Override epochs with max steps (for test runs)")
     return p.parse_args()
 
@@ -31,8 +32,7 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"=== Fine-tuning {args.model} ===")
-    print(f"Settings: epochs={args.epochs}, lr={args.lr}, lora_r={args.lora_r}, lora_alpha={args.lora_alpha}")
-    print(f"batch={args.batch_size}, grad_accum={args.grad_accum}")
+    print(f"Settings: epochs={args.epochs}, lr={args.lr}, lora_r={LORA_R}, lora_alpha={LORA_ALPHA}")
 
     # --- Load training data ---
     with open(args.train_file, "r", encoding="utf-8") as f:
@@ -49,49 +49,49 @@ def main():
             ]
         })
 
-    dataset = Dataset.from_list(conversations)
-
-    # Split into train/eval
-    split = dataset.train_test_split(test_size=args.eval_split, seed=3407)
-    train_dataset = split["train"]
-    eval_dataset = split["test"]
-    print(f"Train split: {len(train_dataset)}, Eval split: {len(eval_dataset)}")
+    train_dataset = Dataset.from_list(conversations)
+    print(f"Training examples: {len(train_dataset)}")
 
     # --- Load model (bf16 LoRA) ---
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
         load_in_4bit=False,
         load_in_16bit=True,
+        max_seq_length=MAX_SEQ_LEN,
     )
 
     # Apply chat template
-    tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
+    tokenizer = get_chat_template(tokenizer, chat_template="qwen3-instruct")
 
-    # Format dataset
+    # Format dataset (convert ShareGPT from/value → role/content for apply_chat_template)
+    _role_map = {"human": "user", "gpt": "assistant"}
+
     def formatting_prompts_func(examples):
         convos = examples["conversations"]
         texts = [
-            tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=False)
+            tokenizer.apply_chat_template(
+                [{"role": _role_map[m["from"]], "content": m["value"]} for m in convo],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
             for convo in convos
         ]
         return {"text": texts}
 
     train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
-    eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
 
     # --- Apply LoRA ---
     model = FastLanguageModel.get_peft_model(
         model,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
         use_gradient_checkpointing="unsloth",
     )
 
     # --- Train ---
     training_args = dict(
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM,
         warmup_ratio=0.1,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
@@ -103,15 +103,9 @@ def main():
         lr_scheduler_type="cosine",
         seed=3407,
         output_dir=args.output_dir,
-        max_seq_length=None,
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=3,
-        eval_strategy="steps",
-        eval_steps=50,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        max_seq_length=MAX_SEQ_LEN,
+        save_strategy="epoch",
+        save_total_limit=1,
         dataset_num_proc=2,
         packing=False,
     )
@@ -122,7 +116,6 @@ def main():
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
         args=SFTConfig(**training_args),
     )
 
@@ -131,12 +124,6 @@ def main():
         instruction_part="<|im_start|>user\n",
         response_part="<|im_start|>assistant\n",
     )
-
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=3,
-        early_stopping_threshold=0.0,
-    )
-    trainer.add_callback(early_stopping)
 
     print("Starting training...")
     trainer_stats = trainer.train()
